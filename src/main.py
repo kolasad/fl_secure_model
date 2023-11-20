@@ -6,71 +6,16 @@ import random
 from sklearn.metrics import accuracy_score
 
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 from tensorflow.keras.optimizers import SGD
 from tensorflow.keras import backend as K
-from keras.datasets import mnist
 
+from clients import create_clients
+from filters import acc_filter
 from models import MLPModel
+from datasets_utils import load_dataset
+from weights_utils import sum_scaled_weights, scale_model_weights
 
-LOGS_DIR = 'results'
-
-
-def load_dataset(dataset_dir: str):
-    if not os.path.exists(dataset_dir):
-        raise FileNotFoundError("Dataset directory not found.")
-
-    images = []
-    labels = []
-
-    # Assuming the dataset directory contains subdirectories for each class
-    class_folders = sorted(os.listdir(dataset_dir))
-
-    for class_id, class_folder in enumerate(class_folders):
-        class_path = os.path.join(dataset_dir, class_folder)
-        if os.path.isdir(class_path):
-            for image_filename in os.listdir(class_path):
-                image_path = os.path.join(class_path, image_filename)
-                images.append(image_path)
-                labels.append(class_id)
-
-    # Split dataset into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(images, labels, test_size=0.2, random_state=42)
-
-    return (X_train, y_train), (X_test, y_test)
-
-
-def batch_data(data_shard, bs=32):
-    """Takes in a clients data shard and create a tfds object off it
-    args:
-        shard: a data, label constituting a client's data shard
-        bs:batch size
-    return:
-        tfds object"""
-    # seperate shard into data and labels lists
-    data, label = zip(*data_shard)
-    dataset = tf.data.Dataset.from_tensor_slices((list(data), list(label)))
-    return dataset.shuffle(len(label)).batch(bs)
-
-
-def scale_model_weights(weight, scalar):
-    """function for scaling a models weights"""
-    weight_final = []
-    steps = len(weight)
-    for i in range(steps):
-        weight_final.append(scalar * weight[i])
-    return weight_final
-
-
-def sum_scaled_weights(scaled_weight_list):
-    """Return the sum of the listed scaled weights. The is equivalent to scaled avg of the weights"""
-    avg_grad = list()
-    # get the average grad accross all client gradients
-    for grad_list_tuple in zip(*scaled_weight_list):
-        layer_mean = tf.math.reduce_sum(grad_list_tuple, axis=0)
-        avg_grad.append(layer_mean)
-
-    return avg_grad
+LOGS_DIR = os.path.join(os.curdir, 'results')
 
 
 def test_model(X_test, Y_test, model, comm_round, log_filename='main.csv', directory='default'):
@@ -80,19 +25,6 @@ def test_model(X_test, Y_test, model, comm_round, log_filename='main.csv', direc
     acc = accuracy_score(tf.argmax(logits, axis=1), tf.argmax(Y_test, axis=1))
     log(log_filename, f'{comm_round},{round(acc * 100, 2)},{loss}', directory)
     return acc, loss
-
-
-def acc_filter(weights=None, accuracies=None):
-    avg_acc = sum(accuracies)/len(accuracies)
-    scaled_local_weight_list_filtered = [
-        x for n, x in enumerate(weights) if accuracies[n] > avg_acc
-    ]
-    # scale the model weights and add to list
-    scaling_factor = 1 / len(scaled_local_weight_list_filtered)
-    scaled_local_weight_list_filtered = [
-        scale_model_weights(x, scaling_factor) for x in scaled_local_weight_list_filtered
-    ]
-    return scaled_local_weight_list_filtered
 
 
 def apply_filter(filter_method, **kwargs):
@@ -105,33 +37,6 @@ def log(filename, results, directory):
         file.write('\n')
 
 
-def create_clients(image_list, label_list, initial='clients', clients_num=5, shuffle_clients=0):
-    # create a list of client names
-    client_names = ['{}_{}'.format(initial, i + 1) for i in range(clients_num)]
-    data = list(zip(image_list, label_list))
-    random.shuffle(data)
-    # shard data and place at each client
-    size = len(data) // clients_num
-    shards = [data[i:i + size] for i in range(0, size * clients_num, size)]
-    # number of clients must equal number of shards
-    assert (len(shards) == len(client_names))
-
-    clients_ = dict()
-    for i in range(len(client_names)):
-        clients_[client_names[i]] = shards[i]
-
-    if shuffle_clients > 0:  # randomly shuffle clients data
-        for i in range(shuffle_clients):
-            images = [x[0] for x in shards[i]]
-            labels = [x[1] for x in shards[i]]
-            random.shuffle(images)
-            random.shuffle(labels)
-            corrupted_shard = list(zip(images, labels))
-            clients_[client_names[i]] = corrupted_shard
-
-    return clients_
-
-
 def start_train_test(
     rounds=50,
     learning_rate=0.01,
@@ -140,47 +45,47 @@ def start_train_test(
     model_name: str = None,
     client_single_round_epochs_num=1,
     corrupt_data_clients_num=0,
-    dataset: str = None,
+    dataset: str = 'mnist',
     detection_method=acc_filter,
 
 ):
     # initial setup
     today = model_name if model_name else datetime.today()
-    os.makedirs(f'{LOGS_DIR}/{today}')
-    if not dataset:
-        (X_train, y_train), (X_test, y_test) = mnist.load_data()
-        X_train = [x/255 for x in X_train.reshape(60000, 784)]  # normalized train images
+    os.makedirs(f'{LOGS_DIR}/{today}', exist_ok=True)
+    if dataset == 'mnist':
+        (X_train, y_train), (X_test, y_test) = tf.keras.datasets.mnist.load_data()
+        X_train = [x/255 for x in X_train.reshape(len(X_train), X_train[0].flatten().shape[0])]  # normalized train images
         new_train = []
         for label in y_train:
-            empty = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            empty = np.zeros(max(y_train) + 1)
             empty[label] = 1
             new_train.append(empty)
 
         y_train = new_train
 
-        X_test = [x/255 for x in X_test.reshape(10000, 784)]  # normalized test images
+        X_test = [x/255 for x in X_test.reshape(len(y_test), y_test[0].flatten().shape[0])]  # normalized test images
         new_train = []
         for label in y_test:
-            empty = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            empty = np.zeros(max(y_test) + 1)
             empty[label] = 1
             new_train.append(empty)
 
         y_test = new_train
     else:
         (X_train, y_train), (X_test, y_test) = load_dataset(dataset)
-        X_train = [x / 255 for x in X_train.reshape(60000, 784)]  # normalized train images
+        X_train = [x/255 for x in X_train.reshape(len(X_train), X_train[0].flatten().shape[0])]  # normalized train images  # normalized train images
         new_train = []
         for label in y_train:
-            empty = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            empty = np.zeros(max(y_train) + 1)
             empty[label] = 1
             new_train.append(empty)
 
         y_train = new_train
 
-        X_test = [x / 255 for x in X_test.reshape(10000, 784)]  # normalized test images
+        X_test = [x/255 for x in X_test.reshape(len(y_test), y_test[0].flatten().shape[0])]  # normalized test images
         new_train = []
         for label in y_test:
-            empty = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            empty = np.zeros(max(y_test) + 1)
             empty[label] = 1
             new_train.append(empty)
 
